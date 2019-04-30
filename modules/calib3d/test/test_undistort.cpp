@@ -933,9 +933,52 @@ double CV_InitUndistortRectifyMapTest::get_success_error_level( int /*test_case_
 }
 
 //////////////////////////////////////////////////////////////////////////////////////////////////////
+class CV_InitUndistortRectifyMapSensorTiltTest : public cvtest::BaseTest
+{
+    virtual void run(int) override;
+};
+
+void CV_InitUndistortRectifyMapSensorTiltTest::run(int)
+{
+    cv::Mat k = cv::Mat::eye(cv::Size(3, 3), CV_32FC1) * 62e2f;
+    cv::Size size_w_h(512 + 3, 512);
+    k.at<float>(0, 2) = size_w_h.width / 2.0f;
+    k.at<float>(1, 2) = size_w_h.height / 2.0f;
+    k.at<float>(2, 2) = 1;
+
+    std::vector<float> x, y;
+    for (int i = 0; i < size_w_h.width; i++) x.push_back((float)i);
+    for (int i = 0; i < size_w_h.height; i++) y.push_back((float)i);
+
+    cv::Mat X, Y;
+    cv::repeat(cv::Mat(x).t(), size_w_h.height, 1, X);
+    cv::repeat(cv::Mat(y), 1, size_w_h.width, Y);
+    cv::Mat mesh_uv;
+    cv::merge(std::vector<cv::Mat>{X, Y}, mesh_uv);
+
+    cv::Matx<double, 1, 14> d{
+        0, 0 ,0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0,
+        0.09, 0.0 };
+
+    cv::Mat mapxy, dst;
+    cv::initUndistortRectifyMap(k, d, cv::noArray(), k, size_w_h, CV_32FC2, mapxy, cv::noArray());
+    cv::undistortPoints(mapxy.reshape(2, mapxy.total()), dst, k, d, cv::noArray(), k);
+    dst = dst.reshape(2, mapxy.rows);
+    cv::Mat diff = dst - mesh_uv;
+
+    if (cv::norm(diff) > 1e-5)
+    {
+        ts->printf(cvtest::TS::LOG, "Error in initUndistortRectifyMap");
+        ts->set_failed_test_info(cvtest::TS::FAIL_BAD_ACCURACY);
+    }
+}
+//////////////////////////////////////////////////////////////////////////////////////////////////////
+
 
 TEST(Calib3d_DefaultNewCameraMatrix, accuracy) { CV_DefaultNewCameraMatrixTest test; test.safe_run(); }
 TEST(Calib3d_UndistortPoints, accuracy) { CV_UndistortPointsTest test; test.safe_run(); }
 TEST(Calib3d_InitUndistortRectifyMap, accuracy) { CV_InitUndistortRectifyMapTest test; test.safe_run(); }
+TEST(Calib3d_InitUndistortRectifyMapSensorTilt, accuracy) { CV_InitUndistortRectifyMapSensorTiltTest test; test.safe_run(); }
 
 }} // namespace
