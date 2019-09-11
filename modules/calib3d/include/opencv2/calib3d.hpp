@@ -1629,6 +1629,13 @@ is similar to distCoeffs1 .
 @param E Output essential matrix.
 @param F Output fundamental matrix.
 @param perViewErrors Output vector of the RMS re-projection error estimated for each pattern view.
+@param rvecs1 Output vector of rotation vectors (see Rodrigues ) estimated for each pattern view
+of the first camera. That is, each k-th rotation vector together with the corresponding k-th
+translation vector (see the next output parameter description) brings the calibration pattern from
+the model coordinate space (in which object points are specified) to the world coordinate space of the first camera,
+that is, a real position of the calibration pattern in the k-th pattern view (k=0.. *M* -1) with respect to the first camera.
+The same with respect to the second camera can be calculated using composeRT and the output parameters R, T.
+@param tvecs1 Output vector of translation vectors estimated for each pattern view with respect to the first camera.
 @param flags Different flags that may be zero or a combination of the following values:
 -   **CALIB_FIX_INTRINSIC** Fix cameraMatrix? and distCoeffs? so that only R, T, E , and F
 matrices are estimated.
@@ -1707,6 +1714,18 @@ CV_EXPORTS_AS(stereoCalibrateExtended) double stereoCalibrate( InputArrayOfArray
                                      Size imageSize, InputOutputArray R,InputOutputArray T, OutputArray E, OutputArray F,
                                      OutputArray perViewErrors, int flags = CALIB_FIX_INTRINSIC,
                                      TermCriteria criteria = TermCriteria(TermCriteria::COUNT+TermCriteria::EPS, 30, 1e-6) );
+
+/// @overload
+CV_EXPORTS_AS(stereoCalibrateExtended2) double stereoCalibrate(
+    InputArrayOfArrays objectPoints1, InputArrayOfArrays objectPoints2,
+    InputArrayOfArrays imagePoints1, InputArrayOfArrays imagePoints2,
+    InputOutputArray cameraMatrix1, InputOutputArray distCoeffs1,
+    InputOutputArray cameraMatrix2, InputOutputArray distCoeffs2,
+    Size imageSize, InputOutputArray R,InputOutputArray T, OutputArray E, OutputArray F,
+    OutputArray perViewErrors,
+    OutputArrayOfArrays rvecs1, OutputArrayOfArrays tvecs1,
+    int flags = CALIB_FIX_INTRINSIC,
+    TermCriteria criteria = TermCriteria(TermCriteria::COUNT+TermCriteria::EPS, 30, 1e-6) );
 
 /// @overload
 CV_EXPORTS_W double stereoCalibrate( InputArrayOfArrays objectPoints,
