@@ -239,12 +239,22 @@ public:
     ocl4dnnFusedActiv_t activType;
     float power;
 #endif
+
+#ifdef HAVE_CUDA
+    cuda4dnn::ConvolutionConfiguration::ActivationType cudaActType;
+    float cuda_relu_slope, cuda_crelu_floor, cuda_crelu_ceil, cuda_power_exp;
+#endif
+
     ConvolutionLayerImpl(const LayerParams &params) : BaseConvolutionLayerImpl(params)
     {
 #ifdef HAVE_OPENCL
         newActiv = false;
         activType = OCL4DNN_CONV_FUSED_ACTIV_NONE;
         power = 0.f;
+#endif
+
+#ifdef HAVE_CUDA
+        cudaActType = cuda4dnn::ConvolutionConfiguration::ActivationType::IDENTITY;
 #endif
     }
 
@@ -404,6 +414,61 @@ public:
             {
                 activType = OCL4DNN_CONV_FUSED_ACTIV_TANH;
             }
+        }
+#endif
+
+#ifdef HAVE_CUDA
+        cudaActType = cuda4dnn::ConvolutionConfiguration::ActivationType::IDENTITY;
+
+        if(IS_DNN_CUDA_TARGET(preferableTarget))
+        {
+            Ptr<ReLULayer> activ_relu = activ.dynamicCast<ReLULayer>();
+            if(!activ_relu.empty())
+            {
+                cudaActType = cuda4dnn::ConvolutionConfiguration::ActivationType::RELU;
+                cuda_relu_slope = activ_relu->negativeSlope;
+            }
+
+            Ptr<ReLU6Layer> activ_relu6 = activ.dynamicCast<ReLU6Layer>();
+            if(!activ_relu6.empty())
+            {
+                cudaActType = cuda4dnn::ConvolutionConfiguration::ActivationType::CLIPPED_RELU;
+                cuda_crelu_floor = activ_relu6->minValue;
+                cuda_crelu_ceil = activ_relu6->maxValue;
+            }
+
+            Ptr<PowerLayer> activ_power = activ.dynamicCast<PowerLayer>();
+            if (!activ_power.empty())
+            {
+                if (activ_power->scale != 1.f || activ_power->shift != 0.f)
+                {
+                    const int outCh = blobs[0].size[0];
+                    fuseWeights(Mat(1, outCh, CV_32F, Scalar(activ_power->scale)),
+                                Mat(1, outCh, CV_32F, Scalar(activ_power->shift)));
+                }
+
+                cuda_power_exp = activ_power->power;
+                cudaActType = cuda4dnn::ConvolutionConfiguration::ActivationType::POWER;
+            }
+
+            Ptr<TanHLayer> activ_tanh = activ.dynamicCast<TanHLayer>();
+            if(!activ_tanh.empty())
+                cudaActType = cuda4dnn::ConvolutionConfiguration::ActivationType::TANH;
+
+            Ptr<SigmoidLayer> activ_sigmoid = activ.dynamicCast<SigmoidLayer>();
+            if(!activ_sigmoid.empty())
+                cudaActType = cuda4dnn::ConvolutionConfiguration::ActivationType::SIGMOID;
+
+            Ptr<SwishLayer> activ_swish = activ.dynamicCast<SwishLayer>();
+            if(!activ_swish.empty())
+                cudaActType = cuda4dnn::ConvolutionConfiguration::ActivationType::SWISH;
+
+            Ptr<MishLayer> activ_mish = activ.dynamicCast<MishLayer>();
+            if(!activ_mish.empty())
+                cudaActType = cuda4dnn::ConvolutionConfiguration::ActivationType::MISH;
+
+            if (cudaActType == cuda4dnn::ConvolutionConfiguration::ActivationType::IDENTITY)
+                activ.reset();
         }
 #endif
         return !activ.empty();
@@ -634,6 +699,12 @@ public:
         const int group = inpCn / inpGroupCn;
 
         std::vector<size_t> kernel_shape = getShape<size_t>(blobs[0]);
+        if (group != 1)
+        {
+            kernel_shape[0] /= group;
+            kernel_shape.insert(kernel_shape.begin(), group);
+        }
+
         auto ieWeights = std::make_shared<ngraph::op::Constant>(ngraph::element::f32, kernel_shape, blobs[0].data);
         if (fusedWeights)
         {
@@ -643,10 +714,10 @@ public:
             }
             else
             {
-                Mat newWeights = blobs[0].reshape(1, outCn);
-                Mat cvWeights = weightsMat.colRange(0, newWeights.cols);
+                Mat newWeights;
+                Mat cvWeights = weightsMat.colRange(0, blobs[0].total() / outCn);
                 cvWeights.copyTo(newWeights);
-                ieWeights = std::make_shared<ngraph::op::Constant>(ngraph::element::f32, kernel_shape, blobs[0].data);
+                ieWeights = std::make_shared<ngraph::op::Constant>(ngraph::element::f32, kernel_shape, newWeights.data);
             }
         }
 
@@ -656,14 +727,12 @@ public:
 
         std::shared_ptr<ngraph::Node> conv_node;
         if (group != 1) {
-            conv_node = std::make_shared<ngraph::op::GroupConvolution>(
+            conv_node = std::make_shared<ngraph::op::v1::GroupConvolution>(
                                 ieInpNode, ieWeights,
                                 ngraph::Strides(strides),
-                                ngraph::Strides(dilations),
                                 ngraph::CoordinateDiff(std::vector<std::ptrdiff_t>(pads_begin.begin(), pads_begin.end())),
                                 ngraph::CoordinateDiff(std::vector<std::ptrdiff_t>(pads_end.begin(),   pads_end.end())),
-                                ngraph::Strides{},
-                                group,
+                                ngraph::Strides(dilations),
                                 pad_type);
         } else {
             conv_node = std::make_shared<ngraph::op::v1::Convolution>(
@@ -1413,6 +1482,12 @@ public:
         config.input_shape.assign(std::begin(input_shape), std::end(input_shape));
         config.output_shape.assign(std::begin(output_shape), std::end(output_shape));
         config.groups = groups;
+
+        config.activation_type = cudaActType;
+        config.relu_negative_slope = cuda_relu_slope;
+        config.crelu_floor = cuda_crelu_floor;
+        config.crelu_ceil = cuda_crelu_ceil;
+        config.power_exp = cuda_power_exp;
 
         Mat filtersMat = fusedWeights ? weightsMat : blobs[0];
         Mat biasMat = (hasBias() || fusedBias) ? Mat(output_feature_maps, 1, CV_32F, biasvec.data()) : Mat();
@@ -2254,41 +2329,33 @@ public:
 
         if (fusedWeights)
         {
-            int inpCn = blobs[0].size[0];
-            Mat newWeights = blobs[0].reshape(1, inpCn);
+            Mat newWeights;
             transpose(weightsMat, newWeights);
+            ieWeights = std::make_shared<ngraph::op::Constant>(ngraph::element::f32, kernel_shape, newWeights.data);
         }
-        size_t batch = ieInpNode->get_shape()[0];
-        std::vector<size_t> out_shape = {batch, (size_t)numOutput};
         std::vector<size_t> paddings_end;
-        std::vector<size_t> inpShape = ieInpNode->get_shape();
         if (padMode.empty())
         {
             for (int i = 0; i < pads_end.size(); i++) {
-                out_shape.push_back(strides[i] * (inpShape[2 + i] - 1) +
-                                    kernel_size[i] - pads_begin[i] - pads_end[i] + adjust_pads[i]);
                 paddings_end.push_back(pads_end[i] - adjust_pads[i]);
             }
         }
         else if (padMode == "SAME")
         {
             for (int i = 0; i < pads_begin.size(); i++) {
-                out_shape.push_back(strides[i] * (inpShape[2 + i] - 1) + 1 + adjust_pads[i]);
                 paddings_end.push_back(kernel_size[i] - pads_begin[i] - 1 - adjust_pads[i]);
             }
         } else {
             paddings_end = pads_end;
         }
 
-        auto deconv = std::make_shared<ngraph::op::ConvolutionBackpropData>(
-                          ngraph::Shape{out_shape},
-                          ieWeights,
+        auto deconv = std::make_shared<ngraph::op::v1::ConvolutionBackpropData>(
                           ieInpNode,
+                          ieWeights,
                           ngraph::Strides(strides),
-                          ngraph::Strides(dilations),
                           ngraph::CoordinateDiff(std::vector<std::ptrdiff_t>(pads_begin.begin(), pads_begin.end())),
                           ngraph::CoordinateDiff(std::vector<std::ptrdiff_t>(paddings_end.begin(), paddings_end.end())),
-                          (strides.size() == 2 ? ngraph::Strides{1, 1} : ngraph::Strides{1, 1, 1}));
+                          ngraph::Strides(dilations));
         if (hasBias() || fusedBias)
         {
             std::vector<size_t> shape(deconv->get_shape().size(), 1);

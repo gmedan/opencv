@@ -16,10 +16,11 @@ using namespace cv;
 using namespace cv::dnn;
 using namespace testing;
 
-static void test(Mat& input, Net& net, Backend backendId, Target targetId, bool skipCheck = false)
+static void test(Mat& input, Net& net, Backend backendId, Target targetId, bool skipCheck = false, bool randInput = true, double l1 = 0.0, double lInf = 0.0)
 {
     DNNTestLayer::checkBackend(backendId, targetId);
-    randu(input, -1.0f, 1.0f);
+    if (randInput)
+        randu(input, -1.0f, 1.0f);
 
     net.setInput(input);
     net.setPreferableBackend(DNN_BACKEND_OPENCV);
@@ -32,8 +33,12 @@ static void test(Mat& input, Net& net, Backend backendId, Target targetId, bool 
     if (skipCheck)
         return;
 
-    double l1, lInf;
-    DNNTestLayer::getDefaultThresholds(backendId, targetId, &l1, &lInf);
+    double default_l1, default_lInf;
+    DNNTestLayer::getDefaultThresholds(backendId, targetId, &default_l1, &default_lInf);
+    if (l1 == 0.0)
+        l1 = default_l1;
+    if (lInf == 0.0)
+        lInf = default_lInf;
 #if 0
     std::cout << "l1=" << l1 << "  lInf=" << lInf << std::endl;
     std::cout << outputDefault.reshape(1, outputDefault.total()).t() << std::endl;
@@ -42,11 +47,11 @@ static void test(Mat& input, Net& net, Backend backendId, Target targetId, bool 
     normAssert(outputDefault, outputHalide, "", l1, lInf);
 }
 
-static void test(LayerParams& params, Mat& input, Backend backendId, Target targetId, bool skipCheck = false)
+static void test(LayerParams& params, Mat& input, Backend backendId, Target targetId, bool skipCheck = false, double l1 = 0.0, double lInf = 0.0)
 {
     Net net;
     net.addLayerToPrev(params.name, params.type, params);
-    test(input, net, backendId, targetId, skipCheck);
+    test(input, net, backendId, targetId, skipCheck, true, l1, lInf);
 }
 
 static inline testing::internal::ParamGenerator<tuple<Backend, Target> > dnnBackendsAndTargetsWithHalide()
@@ -172,6 +177,9 @@ TEST_P(Deconvolution, Accuracy)
             && stride == Size(1, 1) && dilation == Size(1, 1))
         applyTestTag(CV_TEST_TAG_DNN_SKIP_IE_MYRIAD_X);
 #endif
+
+    if (targetId == DNN_TARGET_CUDA_FP16)
+        applyTestTag(CV_TEST_TAG_DNN_SKIP_CUDA_FP16);
 
     int sz[] = {inChannels, outChannels / group, kernel.height, kernel.width};
     Mat weights(4, &sz[0], CV_32F);
@@ -413,7 +421,11 @@ TEST_P(FullyConnected, Accuracy)
 
     int sz[] = {1, inChannels, inSize.height, inSize.width};
     Mat input(4, &sz[0], CV_32F);
-    test(lp, input, backendId, targetId);
+
+    double l1 = 0.0;
+    if (targetId == DNN_TARGET_CUDA_FP16)
+        l1 = 0.015;
+    test(lp, input, backendId, targetId, false, true, l1);
 }
 
 INSTANTIATE_TEST_CASE_P(Layer_Test_Halide, FullyConnected, Combine(
@@ -496,7 +508,7 @@ TEST_P(Test_Halide_layers, MaxPoolUnpool)
 ////////////////////////////////////////////////////////////////////////////////
 static const int kNumChannels = 3;
 
-void testInPlaceActivation(LayerParams& lp, Backend backendId, Target targetId)
+void testInPlaceActivation(LayerParams& lp, Backend backendId, Target targetId, double l1 = 0.0, double lInf = 0.0)
 {
     EXPECT_FALSE(lp.name.empty());
 
@@ -516,7 +528,7 @@ void testInPlaceActivation(LayerParams& lp, Backend backendId, Target targetId)
 
     int sz[] = {1, kNumChannels, 10, 10};
     Mat input(4, &sz[0], CV_32F);
-    test(input, net, backendId, targetId);
+    test(input, net, backendId, targetId, false, true, l1, lInf);
 }
 
 typedef TestWithParam<tuple<bool, bool, float, tuple<Backend, Target> > > BatchNorm;
@@ -776,6 +788,14 @@ TEST_P(Eltwise, Accuracy)
         applyTestTag(CV_TEST_TAG_DNN_SKIP_IE_NGRAPH, CV_TEST_TAG_DNN_SKIP_IE_VERSION);
 #endif
 
+    bool convInputShift = 1;
+    int numEltwiseInputs = numConv;
+    if (op == "div")
+    {
+        numConv = 1;
+        convInputShift = 0; // first input is convolution
+    }
+
     Net net;
 
     std::vector<int> convLayerIds(numConv);
@@ -815,20 +835,29 @@ TEST_P(Eltwise, Accuracy)
     eltwiseParam.type = "Eltwise";
     eltwiseParam.name = "testLayer";
     int eltwiseId = net.addLayer(eltwiseParam.name, eltwiseParam.type, eltwiseParam);
-    net.connect(0, 0, eltwiseId, 0);
+    if (convInputShift == 1)
+        net.connect(0, 0, eltwiseId, 0);
     for (int i = 0; i < numConv; ++i)
     {
-        net.connect(convLayerIds[i], 0, eltwiseId, i + 1);
+        net.connect(convLayerIds[i], 0, eltwiseId, i + convInputShift);
+    }
+    if (convInputShift == 0)
+        net.connect(0, 0, eltwiseId, numConv);
+    for (int i = numConv; i < numEltwiseInputs; ++i)
+    {
+        net.connect(0, 0, eltwiseId, i + 1);
     }
 
     int sz[] = {1, inSize[0], inSize[1], inSize[2]};
     Mat input(4, &sz[0], CV_32F);
-    test(input, net, backendId, targetId);
+    if (op == "div")
+        randu(input, 1.0f, 1.0f);  // ensure no divisor value has absouluate value of less than 0.5
+    test(input, net, backendId, targetId, /*skipCheck*/false, (op == "div") ? false : true);
 }
 
 INSTANTIATE_TEST_CASE_P(Layer_Test_Halide, Eltwise, Combine(
 /*input size*/ Values(Vec3i(1, 4, 5), Vec3i(2, 8, 6)),
-/*operation*/  Values("prod", "sum", "max"),
+/*operation*/  Values("prod", "sum", "div", "max"),
 /*num convs*/  Values(1, 2, 3),
 /*weighted(for sum only)*/ Bool(),
                dnnBackendsAndTargetsWithHalide()

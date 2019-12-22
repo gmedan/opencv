@@ -2405,7 +2405,7 @@ struct Net::Impl
                         break;
                 }
 
-                if (preferableBackend != DNN_BACKEND_OPENCV)
+                if (preferableBackend != DNN_BACKEND_OPENCV && preferableBackend != DNN_BACKEND_CUDA)
                     continue;  // Go to the next layer.
 
                 // TODO: OpenCL target support more fusion styles.
@@ -2413,6 +2413,9 @@ struct Net::Impl
                      (!cv::ocl::useOpenCL() || (ld.layerInstance->type != "Convolution" &&
                      ld.layerInstance->type != "MVN" && ld.layerInstance->type != "Pooling" &&
                      ld.layerInstance->type != "Concat")) )
+                    continue;
+
+                if (preferableBackend == DNN_BACKEND_CUDA && IS_DNN_CUDA_TARGET(preferableTarget) && ld.layerInstance->type != "Convolution")
                     continue;
 
                 while (nextData)
@@ -2424,6 +2427,16 @@ struct Net::Impl
                         nextData->type != "ReLU6" &&
                         nextData->type != "TanH" &&
                         nextData->type != "Power")
+                        break;
+
+                    if (IS_DNN_CUDA_TARGET(preferableTarget) &&
+                        nextData->type != "ReLU" &&
+                        nextData->type != "ReLU6" &&
+                        nextData->type != "Power" &&
+                        nextData->type != "TanH" &&
+                        nextData->type != "Sigmoid" &&
+                        nextData->type != "Swish" &&
+                        nextData->type != "Mish")
                         break;
 
                     Ptr<ActivationLayer> nextActivLayer = nextData->layerInstance.dynamicCast<ActivationLayer>();
@@ -3040,8 +3053,29 @@ struct Net::Impl
         ShapesVec& os = inOutShapes[id].out;
         ShapesVec& ints = inOutShapes[id].internal;
         int requiredOutputs = layers[id].requiredOutputs.size();
-        inOutShapes[id].supportInPlace =
-                layers[id].getLayerInstance()->getMemoryShapes(is, requiredOutputs, os, ints);
+        Ptr<Layer> l = layers[id].getLayerInstance();
+        CV_Assert(l);
+        bool layerSupportInPlace = false;
+        try
+        {
+            layerSupportInPlace = l->getMemoryShapes(is, requiredOutputs, os, ints);
+        }
+        catch (const cv::Exception& e)
+        {
+            CV_LOG_ERROR(NULL, "OPENCV/DNN: [" << l->type << "]:(" << l->name << "): getMemoryShapes() throws exception." <<
+                    " inputs=" << is.size() << " outputs=" << os.size() << "/" << requiredOutputs);
+            for (size_t i = 0; i < is.size(); ++i)
+            {
+                CV_LOG_ERROR(NULL, "    input[" << i << "] = " << toString(is[i]));
+            }
+            for (size_t i = 0; i < os.size(); ++i)
+            {
+                CV_LOG_ERROR(NULL, "    output[" << i << "] = " << toString(os[i]));
+            }
+            CV_LOG_ERROR(NULL, "Exception message: " << e.what());
+            throw;
+        }
+        inOutShapes[id].supportInPlace = layerSupportInPlace;
 
         for (int i = 0; i < ints.size(); i++)
             CV_Assert(total(ints[i]) > 0);
@@ -3158,28 +3192,22 @@ struct Net::Impl
         return getBlobAsync(getPinByAlias(outputName));
     }
 #endif  // CV_CXX11
+
+#ifdef HAVE_INF_ENGINE
+    static
+    Net createNetworkFromModelOptimizer(InferenceEngine::CNNNetwork& ieNet);
+#endif
 };
 
 Net::Net() : impl(new Net::Impl)
 {
 }
 
-Net Net::readFromModelOptimizer(const String& xml, const String& bin)
+#ifdef HAVE_INF_ENGINE
+/*static*/
+Net Net::Impl::createNetworkFromModelOptimizer(InferenceEngine::CNNNetwork& ieNet)
 {
-#ifndef HAVE_INF_ENGINE
-    CV_Error(Error::StsError, "Build OpenCV with Inference Engine to enable loading models from Model Optimizer.");
-#else
-
-#if INF_ENGINE_VER_MAJOR_LE(INF_ENGINE_RELEASE_2019R3)
-    InferenceEngine::CNNNetReader reader;
-    reader.ReadNetwork(xml);
-    reader.ReadWeights(bin);
-
-    InferenceEngine::CNNNetwork ieNet = reader.getNetwork();
-#else
-    InferenceEngine::Core& ie = getCore();
-    InferenceEngine::CNNNetwork ieNet = ie.ReadNetwork(xml, bin);
-#endif
+    CV_TRACE_FUNCTION();
 
     std::vector<String> inputsNames;
     std::vector<MatShape> inp_shapes;
@@ -3259,8 +3287,94 @@ Net Net::readFromModelOptimizer(const String& xml, const String& bin)
 
     cvNet.impl->skipInfEngineInit = true;
     return cvNet;
+}
+#endif  // HAVE_INF_ENGINE
+
+Net Net::readFromModelOptimizer(const String& xml, const String& bin)
+{
+    CV_TRACE_FUNCTION();
+#ifndef HAVE_INF_ENGINE
+    CV_UNUSED(xml); CV_UNUSED(bin);
+    CV_Error(Error::StsError, "Build OpenCV with Inference Engine to enable loading models from Model Optimizer.");
+#else
+#if INF_ENGINE_VER_MAJOR_LE(INF_ENGINE_RELEASE_2019R3)
+    InferenceEngine::CNNNetReader reader;
+    reader.ReadNetwork(xml);
+    reader.ReadWeights(bin);
+
+    InferenceEngine::CNNNetwork ieNet = reader.getNetwork();
+#else
+    InferenceEngine::Core& ie = getCore();
+    InferenceEngine::CNNNetwork ieNet = ie.ReadNetwork(xml, bin);
+#endif
+
+    return Impl::createNetworkFromModelOptimizer(ieNet);
 #endif  // HAVE_INF_ENGINE
 }
+
+Net Net::readFromModelOptimizer(const std::vector<uchar>& bufferModelConfig, const std::vector<uchar>& bufferWeights)
+{
+    CV_TRACE_FUNCTION();
+    CV_Assert(!bufferModelConfig.empty());
+    CV_Assert(!bufferWeights.empty());
+    return readFromModelOptimizer(bufferModelConfig.data(), bufferModelConfig.size(),
+                                           bufferWeights.data(), bufferWeights.size());
+}
+
+Net Net::readFromModelOptimizer(
+        const uchar* bufferModelConfigPtr, size_t bufferModelConfigSize,
+        const uchar* bufferWeightsPtr, size_t bufferWeightsSize
+)
+{
+    CV_TRACE_FUNCTION();
+#ifndef HAVE_INF_ENGINE
+    CV_UNUSED(bufferModelConfigPtr); CV_UNUSED(bufferWeightsPtr);
+    CV_UNUSED(bufferModelConfigSize); CV_UNUSED(bufferModelConfigSize);
+    CV_Error(Error::StsError, "Build OpenCV with Inference Engine to enable loading models from Model Optimizer.");
+#else
+
+#if INF_ENGINE_VER_MAJOR_LE(INF_ENGINE_RELEASE_2019R3)
+    InferenceEngine::CNNNetReader reader;
+
+    try
+    {
+        reader.ReadNetwork(bufferModelConfigPtr, bufferModelConfigSize);
+
+        InferenceEngine::TensorDesc tensorDesc(InferenceEngine::Precision::U8, { bufferWeightsSize }, InferenceEngine::Layout::C);
+        InferenceEngine::TBlob<uint8_t>::Ptr weightsBlobPtr(new InferenceEngine::TBlob<uint8_t>(tensorDesc));
+        weightsBlobPtr->allocate();
+        std::memcpy(weightsBlobPtr->buffer(), (uchar*)bufferWeightsPtr, bufferWeightsSize);
+        reader.SetWeights(weightsBlobPtr);
+    }
+    catch (const std::exception& e)
+    {
+        CV_Error(Error::StsError, std::string("DNN: IE failed to load model: ") + e.what());
+    }
+
+    InferenceEngine::CNNNetwork ieNet = reader.getNetwork();
+#else
+    InferenceEngine::Core& ie = getCore();
+
+    std::string model; model.assign((char*)bufferModelConfigPtr, bufferModelConfigSize);
+
+    InferenceEngine::CNNNetwork ieNet;
+    try
+    {
+        InferenceEngine::TensorDesc tensorDesc(InferenceEngine::Precision::U8, { bufferWeightsSize }, InferenceEngine::Layout::C);
+        InferenceEngine::Blob::CPtr weights_blob = InferenceEngine::make_shared_blob<uint8_t>(tensorDesc, (uint8_t*)bufferWeightsPtr, bufferWeightsSize);
+
+        ieNet = ie.ReadNetwork(model, weights_blob);
+    }
+    catch (const std::exception& e)
+    {
+        CV_Error(Error::StsError, std::string("DNN: IE failed to load model: ") + e.what());
+    }
+#endif
+
+    return Impl::createNetworkFromModelOptimizer(ieNet);
+#endif  // HAVE_INF_ENGINE
+}
+
 
 Net::~Net()
 {
@@ -4622,13 +4736,29 @@ Net readNet(const String& _framework, const std::vector<uchar>& bufferModel,
     else if (framework == "torch")
         CV_Error(Error::StsNotImplemented, "Reading Torch models from buffers");
     else if (framework == "dldt")
-        CV_Error(Error::StsNotImplemented, "Reading Intel's Model Optimizer models from buffers");
+        return readNetFromModelOptimizer(bufferConfig, bufferModel);
     CV_Error(Error::StsError, "Cannot determine an origin framework with a name " + framework);
 }
 
 Net readNetFromModelOptimizer(const String &xml, const String &bin)
 {
     return Net::readFromModelOptimizer(xml, bin);
+}
+
+Net readNetFromModelOptimizer(const std::vector<uchar>& bufferCfg, const std::vector<uchar>& bufferModel)
+{
+    return Net::readFromModelOptimizer(bufferCfg, bufferModel);
+}
+
+Net readNetFromModelOptimizer(
+        const uchar* bufferModelConfigPtr, size_t bufferModelConfigSize,
+        const uchar* bufferWeightsPtr, size_t bufferWeightsSize
+)
+{
+    return Net::readFromModelOptimizer(
+        bufferModelConfigPtr, bufferModelConfigSize,
+        bufferWeightsPtr, bufferWeightsSize
+    );
 }
 
 CV__DNN_INLINE_NS_END

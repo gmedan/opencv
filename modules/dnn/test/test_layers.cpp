@@ -141,6 +141,8 @@ TEST_P(Test_Caffe_layers, Convolution)
 
 TEST_P(Test_Caffe_layers, DeConvolution)
 {
+    if(target == DNN_TARGET_CUDA_FP16)
+        applyTestTag(CV_TEST_TAG_DNN_SKIP_CUDA_FP16);
     testLayerUsingCaffeModels("layer_deconvolution", true, false);
 }
 
@@ -372,7 +374,13 @@ TEST_P(Test_Caffe_layers, Conv_Elu)
     net.setPreferableTarget(target);
     Mat out = net.forward();
 
-    normAssert(ref, out, "", default_l1, default_lInf);
+    double l1 = default_l1, lInf = default_lInf;
+    if (target == DNN_TARGET_CUDA_FP16)
+    {
+        l1 = 0.0002;
+        lInf = 0.0005;
+    }
+    normAssert(ref, out, "", l1, lInf);
 }
 
 class Layer_LSTM_Test : public ::testing::Test
@@ -843,6 +851,11 @@ TEST_P(Test_Caffe_layers, PriorBox_repeated)
 
     double l1 = (target == DNN_TARGET_OPENCL_FP16 || target == DNN_TARGET_MYRIAD) ? 1e-3 : 1e-5;
     double lInf = (target == DNN_TARGET_OPENCL_FP16 || target == DNN_TARGET_MYRIAD) ? 1e-3 : 1e-4;
+    if (target == DNN_TARGET_CUDA_FP16)
+    {
+        l1 = 7e-5;
+        lInf = 0.0005;
+    }
     normAssert(out, ref, "", l1, lInf);
 }
 
@@ -876,7 +889,9 @@ TEST_P(Test_Caffe_layers, PriorBox_squares)
                                        0.25, 0.0, 1.0, 1.0,
                                        0.1f, 0.1f, 0.2f, 0.2f,
                                        0.1f, 0.1f, 0.2f, 0.2f);
-    double l1 = (target == DNN_TARGET_OPENCL_FP16 || target == DNN_TARGET_MYRIAD) ? 2e-5 : 1e-5;
+    double l1 = 1e-5;
+    if (target == DNN_TARGET_OPENCL_FP16 || target == DNN_TARGET_MYRIAD || target == DNN_TARGET_CUDA_FP16)
+        l1 = 2e-5;
     normAssert(out.reshape(1, 4), ref, "", l1);
 }
 
@@ -1225,6 +1240,11 @@ TEST_P(Test_DLDT_two_inputs, as_backend)
     // Output values are in range [0, 637.5].
     double l1 = (targetId == DNN_TARGET_OPENCL_FP16 || targetId == DNN_TARGET_MYRIAD) ? 0.06 : 1e-6;
     double lInf = (targetId == DNN_TARGET_OPENCL_FP16 || targetId == DNN_TARGET_MYRIAD) ? 0.3 : 1e-5;
+    if (targetId == DNN_TARGET_CUDA_FP16)
+    {
+        l1 = 0.06;
+        lInf = 0.3;
+    }
     normAssert(out, ref, "", l1, lInf);
 }
 
@@ -1537,8 +1557,17 @@ TEST_P(Layer_Test_ShuffleChannel, Accuracy)
     net.setPreferableTarget(targetId);
     Mat out = net.forward();
 
-    double l1 = (targetId == DNN_TARGET_OPENCL_FP16) ? 5e-2 : 1e-5;
-    double lInf = (targetId == DNN_TARGET_OPENCL_FP16) ? 7e-2 : 1e-4;
+    double l1 = 1e-5, lInf = 1e-4;
+    if (targetId == DNN_TARGET_OPENCL_FP16)
+    {
+        l1 = 5e-2;
+        lInf = 7e-2;
+    }
+    else if (targetId == DNN_TARGET_CUDA_FP16)
+    {
+        l1 = 0.06;
+        lInf = 0.07;
+    }
     for (int n = 0; n < inpShapeVec[0]; ++n)
     {
         for (int c = 0; c < inpShapeVec[1]; ++c)
@@ -1587,30 +1616,31 @@ TEST(Layer_Test_Convolution, relu_fusion)
 }
 
 typedef testing::TestWithParam<tuple<bool, tuple<Backend, Target> > > Layer_Test_Eltwise_unequal;
-TEST_P(Layer_Test_Eltwise_unequal, Accuracy)
+TEST_P(Layer_Test_Eltwise_unequal, accuracy_input_0_truncate)
 {
     bool weighted = get<0>(GetParam());
     int backendId = get<0>(get<1>(GetParam()));
     int targetId = get<1>(get<1>(GetParam()));
 
-    if (backendId == DNN_BACKEND_OPENCV && targetId == DNN_TARGET_OPENCL_FP16)
-        applyTestTag(CV_TEST_TAG_DNN_SKIP_OPENCL_FP16);
+    if (backendId == DNN_BACKEND_CUDA)
+        applyTestTag(CV_TEST_TAG_DNN_SKIP_CUDA);
 
     Net net;
     LayerParams lp;
     lp.type = "Eltwise";
     lp.name = "testLayer";
+    lp.set<std::string>("output_channels_mode", "input_0_truncate");
 
     const int inpShapes[][4] = {{1, 4, 2, 2}, {1, 5, 2, 2}, {1, 3, 2, 2}};
+    const int out_channels = inpShapes[0][1];
     std::vector<String> inpNames(3);
     std::vector<Mat> inputs(3);
-    size_t numOutValues = 1*4*2*2;  // By the first input
 
     std::vector<float> weights(3, 1);
     if (weighted)
     {
         for (int i = 0; i < inputs.size(); ++i)
-            randu(Mat(1, 1, CV_32F, &weights[i]), -1, 1);
+            weights[i] = -0.125f + i * 0.25f;
         lp.set("coeff", DictValue::arrayReal<float*>(&weights[0], weights.size()));
     }
 
@@ -1618,27 +1648,106 @@ TEST_P(Layer_Test_Eltwise_unequal, Accuracy)
     for (int i = 0; i < inputs.size(); ++i)
     {
         inputs[i].create(4, inpShapes[i], CV_32F);
-        randu(inputs[i], 0, 255);
+        size_t total = inputs[i].total();
+        for (size_t j = 0; j < total; j++)
+            inputs[i].ptr<float>()[j] = j + i * 100;
         inpNames[i] = format("input_%d", i);
         net.connect(0, i, eltwiseId, i);
     }
-    Mat ref(1, numOutValues, CV_32F, Scalar(0));
+    Mat ref(4, inpShapes[0], CV_32F, Scalar(0));
 
     net.setInputsNames(inpNames);
     for (int i = 0; i < inputs.size(); ++i)
     {
+        //std::cout << ref.reshape(1,1) << endl;
         net.setInput(inputs[i], inpNames[i]);
-        if (numOutValues >= inputs[i].total())
-            ref.colRange(0, inputs[i].total()) += weights[i] * inputs[i].reshape(1, 1);
-        else
-            ref += weights[i] * inputs[i].reshape(1, 1).colRange(0, numOutValues);
+        for (size_t batchId = 0; batchId < ref.size[0]; batchId++)
+        {
+            int input_channels = inputs[i].size[1];
+            Range ranges[4] = { Range(batchId, batchId + 1), Range(0, std::min(out_channels, input_channels)), Range::all(), Range::all() };
+            Mat ref_slice = ref(ranges);
+            Mat input_slice = inputs[i](ranges);
+            ref_slice += weights[i] * input_slice;
+        }
     }
 
     net.setPreferableBackend(backendId);
     net.setPreferableTarget(targetId);
     Mat out = net.forward();
-    normAssert(out.reshape(1, 1), ref);
+    normAssert(out, ref);
+    if (testing::Test::HasFailure())
+    {
+        std::cout << out.reshape(1,1) << endl;
+        std::cout << ref.reshape(1,1) << endl;
+    }
 }
+
+TEST_P(Layer_Test_Eltwise_unequal, accuracy_input_0)
+{
+    bool weighted = get<0>(GetParam());
+    int backendId = get<0>(get<1>(GetParam()));
+    int targetId = get<1>(get<1>(GetParam()));
+
+    if (backendId == DNN_BACKEND_CUDA)
+        applyTestTag(CV_TEST_TAG_DNN_SKIP_CUDA);
+
+    Net net;
+    LayerParams lp;
+    lp.type = "Eltwise";
+    lp.name = "testLayer";
+    lp.set<std::string>("output_channels_mode", "input_0");
+
+    const int inpShapes[][4] = {{1, 4, 2, 2}, {1, 2, 2, 2}, {1, 3, 2, 2}};
+    const int out_channels = inpShapes[0][1];
+    std::vector<String> inpNames(3);
+    std::vector<Mat> inputs(3);
+
+    std::vector<float> weights(3, 1);
+    if (weighted)
+    {
+        for (int i = 0; i < inputs.size(); ++i)
+            weights[i] = -0.125f + i * 0.25f;
+        lp.set("coeff", DictValue::arrayReal<float*>(&weights[0], weights.size()));
+    }
+
+    int eltwiseId = net.addLayer(lp.name, lp.type, lp);
+    for (int i = 0; i < inputs.size(); ++i)
+    {
+        inputs[i].create(4, inpShapes[i], CV_32F);
+        size_t total = inputs[i].total();
+        for (size_t j = 0; j < total; j++)
+            inputs[i].ptr<float>()[j] = j + i * 100;
+        inpNames[i] = format("input_%d", i);
+        net.connect(0, i, eltwiseId, i);
+    }
+    Mat ref(4, inpShapes[0], CV_32F, Scalar(0));
+
+    net.setInputsNames(inpNames);
+    for (int i = 0; i < inputs.size(); ++i)
+    {
+        //std::cout << ref.reshape(1,1) << endl;
+        net.setInput(inputs[i], inpNames[i]);
+        for (size_t batchId = 0; batchId < ref.size[0]; batchId++)
+        {
+            int input_channels = inputs[i].size[1];
+            Range ranges[4] = { Range(batchId, batchId + 1), Range(0, std::min(out_channels, input_channels)), Range::all(), Range::all() };
+            Mat ref_slice = ref(ranges);
+            Mat input_slice = inputs[i](ranges);
+            ref_slice += weights[i] * input_slice;
+        }
+    }
+
+    net.setPreferableBackend(backendId);
+    net.setPreferableTarget(targetId);
+    Mat out = net.forward();
+    normAssert(out, ref);
+    if (testing::Test::HasFailure())
+    {
+        std::cout << out.reshape(1,1) << endl;
+        std::cout << ref.reshape(1,1) << endl;
+    }
+}
+
 INSTANTIATE_TEST_CASE_P(/**/, Layer_Test_Eltwise_unequal, Combine(
     testing::Bool(),
     dnnBackendsAndTargets()

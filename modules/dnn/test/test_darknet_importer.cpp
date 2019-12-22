@@ -99,6 +99,7 @@ class Test_Darknet_layers : public DNNTestLayer
 public:
     void testDarknetLayer(const std::string& name, bool hasWeights = false)
     {
+        SCOPED_TRACE(name);
         Mat inp = blobFromNPY(findDataFile("dnn/darknet/" + name + "_in.npy"));
         Mat ref = blobFromNPY(findDataFile("dnn/darknet/" + name + "_out.npy"));
 
@@ -115,6 +116,47 @@ public:
         net.setInput(inp);
         Mat out = net.forward();
         normAssert(out, ref, "", default_l1, default_lInf);
+
+        if (inp.size[0] == 1)  // test handling of batch size
+        {
+            SCOPED_TRACE("batch size 2");
+
+#if defined(INF_ENGINE_RELEASE)
+            if (target == DNN_TARGET_MYRIAD && name == "shortcut")
+                applyTestTag(CV_TEST_TAG_DNN_SKIP_IE_MYRIAD);
+#endif
+
+            std::vector<int> sz2 = shape(inp);
+            sz2[0] = 2;
+
+            Net net2 = readNet(cfg, model);
+            net2.setPreferableBackend(backend);
+            net2.setPreferableTarget(target);
+            Range ranges0[4] = { Range(0, 1), Range::all(), Range::all(), Range::all() };
+            Range ranges1[4] = { Range(1, 2), Range::all(), Range::all(), Range::all() };
+            Mat inp2(sz2, inp.type(), Scalar::all(0));
+            inp.copyTo(inp2(ranges0));
+            inp.copyTo(inp2(ranges1));
+            net2.setInput(inp2);
+            Mat out2 = net2.forward();
+            EXPECT_EQ(0, cv::norm(out2(ranges0), out2(ranges1), NORM_INF)) << "Batch result is not equal: " << name;
+
+            Mat ref2 = ref;
+            if (ref.dims == 2 && out2.dims == 3)
+            {
+                int ref_3d_sizes[3] = {1, ref.rows, ref.cols};
+                ref2 = Mat(3, ref_3d_sizes, ref.type(), (void*)ref.data);
+            }
+            /*else if (ref.dims == 3 && out2.dims == 4)
+            {
+                int ref_4d_sizes[4] = {1, ref.size[0], ref.size[1], ref.size[2]};
+                ref2 = Mat(4, ref_4d_sizes, ref.type(), (void*)ref.data);
+            }*/
+            ASSERT_EQ(out2.dims, ref2.dims) << ref.dims;
+
+            normAssert(out2(ranges0), ref2, "", default_l1, default_lInf);
+            normAssert(out2(ranges1), ref2, "", default_l1, default_lInf);
+        }
     }
 };
 
@@ -278,9 +320,18 @@ TEST_P(Test_Darknet_nets, YoloVoc)
                                     1, 6,  0.667770f, 0.446555f, 0.453578f, 0.499986f, 0.519167f,  // a car
                                     1, 6,  0.844947f, 0.637058f, 0.460398f, 0.828508f, 0.66427f);  // a car
 
-    double scoreDiff = (target == DNN_TARGET_OPENCL_FP16 || target == DNN_TARGET_MYRIAD) ? 1e-2 : 8e-5;
-    double iouDiff = (target == DNN_TARGET_OPENCL_FP16 || target == DNN_TARGET_MYRIAD) ? 0.018 : 3e-4;
     double nmsThreshold = (target == DNN_TARGET_MYRIAD) ? 0.397 : 0.4;
+    double scoreDiff = 8e-5, iouDiff = 3e-4;
+    if (target == DNN_TARGET_OPENCL_FP16 || target == DNN_TARGET_MYRIAD)
+    {
+        scoreDiff = 1e-2;
+        iouDiff = 0.018;
+    }
+    else if (target == DNN_TARGET_CUDA_FP16)
+    {
+        scoreDiff = 0.03;
+        iouDiff = 0.018;
+    }
 
     std::string config_file = "yolo-voc.cfg";
     std::string weights_file = "yolo-voc.weights";
@@ -311,8 +362,17 @@ TEST_P(Test_Darknet_nets, TinyYoloVoc)
                                     1, 6,  0.651450f, 0.460526f, 0.458019f, 0.522527f, 0.5341f,    // a car
                                     1, 6,  0.928758f, 0.651024f, 0.463539f, 0.823784f, 0.654998f); // a car
 
-    double scoreDiff = (target == DNN_TARGET_OPENCL_FP16 || target == DNN_TARGET_MYRIAD) ? 8e-3 : 8e-5;
-    double iouDiff = (target == DNN_TARGET_OPENCL_FP16 || target == DNN_TARGET_MYRIAD) ? 0.018 : 3e-4;
+    double scoreDiff = 8e-5, iouDiff = 3e-4;
+    if (target == DNN_TARGET_OPENCL_FP16 || target == DNN_TARGET_MYRIAD)
+    {
+        scoreDiff = 8e-3;
+        iouDiff = 0.018;
+    }
+    else if(target == DNN_TARGET_CUDA_FP16)
+    {
+        scoreDiff = 0.008;
+        iouDiff = 0.02;
+    }
 
     std::string config_file = "tiny-yolo-voc.cfg";
     std::string weights_file = "tiny-yolo-voc.weights";
@@ -411,9 +471,17 @@ TEST_P(Test_Darknet_nets, YOLOv3)
                                     1, 2,  0.989633f, 0.450719f, 0.463353f, 0.496305f, 0.522258f,  // a car
                                     1, 2,  0.997412f, 0.647584f, 0.459939f, 0.821038f, 0.663947f); // a car
 
-    double scoreDiff = (target == DNN_TARGET_OPENCL_FP16 || target == DNN_TARGET_MYRIAD) ? 0.006 : 8e-5;
-    double iouDiff = (target == DNN_TARGET_OPENCL_FP16 || target == DNN_TARGET_MYRIAD) ? 0.018 : 3e-4;
-
+    double scoreDiff = 8e-5, iouDiff = 3e-4;
+    if (target == DNN_TARGET_OPENCL_FP16 || target == DNN_TARGET_MYRIAD)
+    {
+        scoreDiff = 0.006;
+        iouDiff = 0.018;
+    }
+    else if (target == DNN_TARGET_CUDA_FP16)
+    {
+        scoreDiff = 0.04;
+        iouDiff = 0.03;
+    }
     std::string config_file = "yolov3.cfg";
     std::string weights_file = "yolov3.weights";
 
@@ -459,6 +527,8 @@ INSTANTIATE_TEST_CASE_P(/**/, Test_Darknet_nets, dnnBackendsAndTargets());
 
 TEST_P(Test_Darknet_layers, shortcut)
 {
+    if (backend == DNN_BACKEND_CUDA)
+        applyTestTag(CV_TEST_TAG_DNN_SKIP_CUDA);
     testDarknetLayer("shortcut");
     testDarknetLayer("shortcut_leaky");
     testDarknetLayer("shortcut_unequal");
