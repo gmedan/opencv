@@ -3461,8 +3461,6 @@ static void collectCalibrationData( InputArrayOfArrays objectPoints1,
             }
             j += numberOfObjectPoints;
         }
-
-        j += numberOfObjectPoints;
     }
 
     int ni = npoints1.at<int>(0);
